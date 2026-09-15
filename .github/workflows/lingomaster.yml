@@ -1,0 +1,185 @@
+# Copy into .github/workflows/lingomaster.yml in your mpv-winbuild-cmake fork.
+# First Linux build is intentionally user-run. This file is not proof of a build.
+name: mpv 0.41.0 with corresponding source
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+env:
+  RECIPE_COMMIT: cd1edc11dc6887a50f705717619d879f5a93a488
+  MPV_TAG: v0.41.0
+  MPV_SHA256: ee21092a5ee427353392360929dc64645c54479aefdb5babc5cfbb5fad626209
+defaults:
+  run:
+    shell: bash
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          path: fork
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: shinchiro/mpv-winbuild-cmake
+          ref: ${{ env.RECIPE_COMMIT }}
+          persist-credentials: false
+          path: work/recipes
+      - name: Install host build tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential bison flex gettext git mercurial subversion \
+            ninja-build gyp cmake yasm nasm automake pkgconf libtool libtool-bin \
+            gcc-multilib g++-multilib clang lld libgmp-dev libmpfr-dev libmpc-dev \
+            libgcrypt20-dev gperf ragel texinfo autopoint re2c asciidoc python3-venv \
+            docbook2x unzip p7zip-full curl ccache zstd zip
+          python3 -m venv "$RUNNER_TEMP/mpv-python"
+          "$RUNNER_TEMP/mpv-python/bin/pip" install meson rst2pdf mako jsonschema
+          echo "$RUNNER_TEMP/mpv-python/bin" >> "$GITHUB_PATH"
+      - name: Pin mpv and preserve sources after compilation
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, pathlib, re
+          recipes = pathlib.Path('work/recipes')
+          path = recipes / 'packages/mpv-release.cmake'
+          text = path.read_text(encoding='utf-8')
+          # This upstream revision has neither build.sh nor MPV_TARBALL.
+          # Replace the latest-release redirect with a hash-checked fixed URL.
+          marker = 'ExternalProject_Add(mpv-release'
+          assert text.count(marker) == 1 and text.count('URL ${LINK}') == 1
+          text = text[text.index(marker):].replace('URL ${LINK}',
+              'URL https://codeload.github.com/mpv-player/mpv/tar.gz/refs/tags/' + os.environ['MPV_TAG']
+              + '\n    URL_HASH SHA256=' + os.environ['MPV_SHA256'])
+          path.write_text(text, encoding='utf-8')
+          path = recipes / 'cmake/custom_steps.cmake'
+          text, count = re.subn(r'    ExternalProject_Add_Step\(\$\{_name\} postremovebuild\n.*?\n    \)\n',
+                               '', path.read_text(encoding='utf-8'), flags=re.S)
+          assert count == 1, 'Source-preservation patch no longer matches'
+          path.write_text(text, encoding='utf-8')
+          PY
+          mkdir -p work/provenance
+          cp fork/.github/workflows/lingomaster.yml work/provenance/workflow.yml
+          git -C work/recipes diff --binary > work/provenance/recipe.patch
+          dpkg-query -W > work/provenance/host-packages.txt
+          pip freeze > work/provenance/python-build-tools.txt
+          # GCC is an upstream-supported, shorter cold build; generic x86-64 ISA.
+          cmake -G Ninja -S work/recipes -B work/build \
+            -DTARGET_ARCH=x86_64-w64-mingw32 -DGCC_ARCH=x86-64 \
+            -DSINGLE_SOURCE_LOCATION="$GITHUB_WORKSPACE/work/src_packages" \
+            -DRUSTUP_LOCATION="$GITHUB_WORKSPACE/work/install_rustup"
+      - name: Compile toolchain and fixed mpv release
+        run: |
+          set -euo pipefail
+          ninja -C work/build gcc
+          ninja -C work/build rustup
+          ninja -C work/build mpv-release
+          test -f work/build/mpv-0.41.0-x86_64/mpv.exe
+          test "$(cat work/src_packages/mpv-release/MPV_VERSION)" = 0.41.0
+      - name: Archive corresponding sources and build provenance
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, shutil, subprocess
+          root = pathlib.Path('work')
+          package = root / 'build/mpv-0.41.0-x86_64'
+          manifest = {'mpv_tag': os.environ['MPV_TAG'], 'recipe_commit': os.environ['RECIPE_COMMIT'],
+                      'mpv_tarball_sha256': os.environ['MPV_SHA256'], 'git': [], 'files': []}
+          def git(path, *args):
+              return subprocess.check_output(['git', '-C', str(path), *args], text=True).strip()
+          included = ('src_packages', 'recipes', 'provenance')
+          for name in included:
+              assert (root / name).is_dir() and any((root / name).iterdir()), name
+          toolchain = []
+          for directory in (root / 'build', root / 'install_rustup'):
+              for base, dirs, files in os.walk(directory):
+                  if pathlib.Path(base).name != 'bin':
+                      continue
+                  for name in sorted(files):
+                      if not (name.endswith(('-gcc', '-g++', '-ld', '-ar'))
+                              or name in ('rustc', 'cargo')):
+                          continue
+                      path = pathlib.Path(base) / name
+                      if not path.is_file():
+                          continue
+                      with path.open('rb') as stream:
+                          digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+                      version = subprocess.run([str(path.resolve()), '--version'],
+                          capture_output=True, text=True, errors='replace', timeout=30)
+                      toolchain.append({'path': str(path.relative_to(root)), 'sha256': digest,
+                                        'version': version.stdout, 'returncode': version.returncode})
+          assert toolchain, 'No toolchain provenance found'
+          (root / 'provenance/toolchain.json').write_text(
+              json.dumps(toolchain, indent=2) + '\n', encoding='utf-8')
+          for name in included:
+              for base, dirs, files in os.walk(root / name):
+                  path = pathlib.Path(base)
+                  if '.git' in dirs or '.git' in files:
+                      patch = git(path, 'diff', '--binary', 'HEAD')
+                      manifest['git'].append({'path': str(path.relative_to(root)),
+                          'commit': git(path, 'rev-parse', 'HEAD'),
+                          'status': git(path, 'status', '--porcelain'),
+                          'patch': patch,
+                          'submodules': git(path, 'submodule', 'status', '--recursive')})
+                  # The tar includes .git, patched source trees and downloads.
+                  # Installed toolchains and build objects are not source payload.
+                  dirs[:] = [d for d in dirs if d != '.git']
+                  for filename in sorted(files):
+                      file = path / filename
+                      if file.is_symlink() or not file.is_file():
+                          continue
+                      with file.open('rb') as stream:
+                          digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+                      manifest['files'].append({'path': str(file.relative_to(root)), 'sha256': digest})
+          (root / 'versions.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
+          shutil.copy2(root / 'versions.json', 'output/versions.json')
+          shutil.copy2(root / 'src_packages/ffmpeg/COPYING.GPLv3', 'output/GPL-3.0.txt')
+          shutil.copy2('output/GPL-3.0.txt', package / 'GPL-3.0.txt')
+          shutil.copy2(root / 'src_packages/mpv-release/Copyright', package / 'Copyright')
+          tag = 'lingomaster-mpv-0.41.0-' + os.environ['GITHUB_RUN_ID']
+          source_url = 'https://github.com/' + os.environ['GITHUB_REPOSITORY'] + '/releases/tag/' + tag
+          (package / 'SOURCE.txt').write_text('mpv and linked GPL components: GPL-3.0.\n'
+              'Full corresponding source, patches, versions and build instructions: ' + source_url + '\n'
+              'Source archive contains source packages, recipes and provenance; see work/provenance/workflow.yml.\n'
+              'For split archives follow SOURCE_RESTORE.txt and verify SHA256SUMS.\n', encoding='utf-8')
+          PY
+          (cd work/build/mpv-0.41.0-x86_64 && zip -qr "$GITHUB_WORKSPACE/output/mpv-0.41.0-x86_64.zip" .)
+          source="$RUNNER_TEMP/mpv-0.41.0-corresponding-source.tar.zst"
+          tar -I 'zstd -T0 -3' -cf "$source" \
+            work/src_packages work/recipes work/provenance work/versions.json
+          (cd "$RUNNER_TEMP" && sha256sum mpv-0.41.0-corresponding-source.tar.zst) > output/SOURCE_SHA256
+          if [ "$(stat -c %s "$source")" -gt 1887436800 ]; then
+            split -b 1800M -d --suffix-length=3 "$source" output/mpv-0.41.0-corresponding-source.tar.zst.part
+          else
+            mv "$source" output/
+          fi
+          cat > output/SOURCE_RESTORE.txt <<'EOF'
+          Verify downloaded assets with: sha256sum -c SHA256SUMS
+          If .partNNN files are present, concatenate in numeric order:
+            cat mpv-0.41.0-corresponding-source.tar.zst.part* > mpv-0.41.0-corresponding-source.tar.zst
+          Verify the complete archive with: sha256sum -c SOURCE_SHA256
+          Extract with: tar -I zstd -xf mpv-0.41.0-corresponding-source.tar.zst
+          Build instructions: work/provenance/workflow.yml
+          Source paths: work/src_packages, work/recipes, work/provenance, work/versions.json
+          Installed compiler binaries and build objects are excluded. Compiler sources,
+          exact source revisions, patches, host packages and compiler hashes are recorded.
+          EOF
+          (cd output && sha256sum mpv-* GPL-3.0.txt versions.json SOURCE_SHA256 SOURCE_RESTORE.txt > SHA256SUMS)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mpv-binary-and-corresponding-source
+          path: output/*
+          if-no-files-found: error
+      - name: Create reviewable draft with binary and source together
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "lingomaster-mpv-0.41.0-$GITHUB_RUN_ID" output/* \
+            --repo "$GITHUB_REPOSITORY" --draft \
+            --title 'LingoMaster mpv 0.41.0 - pending validation' \
+            --notes 'Binary, corresponding sources, build recipes, provenance, GPL text and hashes are attached together. SOURCE_RESTORE.txt describes split archive reconstruction. Validate Windows playback and source completeness before publishing or syncing to R2.'
