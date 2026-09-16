@@ -75,6 +75,11 @@ jobs:
           text = text[text.index(marker):].replace('URL ${LINK}',
               'URL https://codeload.github.com/mpv-player/mpv/tar.gz/refs/tags/' + os.environ['MPV_TAG']
               + '\n    URL_HASH SHA256=' + os.environ['MPV_SHA256'])
+          # This recipe also targets newer mpv; v0.41.0 has no subrandr option.
+          assert os.environ['MPV_TAG'] == 'v0.41.0', 'Recheck release-specific options'
+          unsupported = '        -Dsubrandr=enabled\n'
+          assert text.count(unsupported) == 1, 'mpv subrandr option patch no longer matches'
+          text = text.replace(unsupported, '')
           path.write_text(text, encoding='utf-8')
           path = recipes / 'cmake/custom_steps.cmake'
           text, count = re.subn(r'    ExternalProject_Add_Step\(\$\{_name\} postremovebuild\n.*?\n    \)\n',
