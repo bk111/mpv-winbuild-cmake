@@ -27,6 +27,14 @@ jobs:
           ref: ${{ env.RECIPE_COMMIT }}
           persist-credentials: false
           path: work/recipes
+      - name: Configure Git identity for source patches
+        run: |
+          set -euo pipefail
+          # git am in every dependency checkout needs a committer identity.
+          # This global config belongs to the disposable CI runner.
+          git config --global user.name "student"
+          git config --global user.email "blackantt@gmail.com"
+          git var GIT_COMMITTER_IDENT
       - name: Install host build tools
         run: |
           set -euo pipefail
