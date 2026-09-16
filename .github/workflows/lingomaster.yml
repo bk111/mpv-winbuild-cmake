@@ -80,6 +80,14 @@ jobs:
           unsupported = '        -Dsubrandr=enabled\n'
           assert text.count(unsupported) == 1, 'mpv subrandr option patch no longer matches'
           text = text.replace(unsupported, '')
+          # v0.41.0 links getVSScriptAPI directly; this header-only recipe cannot supply it.
+          # The language-learning player does not use VapourSynth filter scripts.
+          vapoursynth_option = '        -Dvapoursynth=enabled\n'
+          assert text.count(vapoursynth_option) == 1, 'mpv VapourSynth option patch no longer matches'
+          text = text.replace(vapoursynth_option, '        -Dvapoursynth=disabled\n')
+          vapoursynth_dependency = '        vapoursynth\n'
+          assert text.count(vapoursynth_dependency) == 1, 'mpv VapourSynth dependency patch no longer matches'
+          text = text.replace(vapoursynth_dependency, '')
           command = 'BUILD_COMMAND ${EXEC} LTO_JOB=1 ninja -C <BINARY_DIR>'
           assert text.count(command) == 1, 'mpv verbose build patch no longer matches'
           text = text.replace(command, command.replace('ninja -C', 'ninja -v -C'))
