@@ -190,13 +190,93 @@ jobs:
           import hashlib, json, os, pathlib, shutil, subprocess
           root = pathlib.Path('work')
           package = root / 'build/mpv-0.41.0-x86_64'
-          manifest = {'mpv_tag': os.environ['MPV_TAG'], 'recipe_commit': os.environ['RECIPE_COMMIT'],
-                      'mpv_tarball_sha256': os.environ['MPV_SHA256'], 'git': [], 'files': []}
+          manifest = {'schema_version': 2, 'mpv_tag': os.environ['MPV_TAG'],
+                      'recipe_commit': os.environ['RECIPE_COMMIT'],
+                      'mpv_tarball_sha256': os.environ['MPV_SHA256'],
+                      'git': [], 'files': [], 'symlinks': []}
           def git(path, *args):
-              return subprocess.check_output(['git', '-C', str(path), *args], text=True).strip()
+              return subprocess.check_output(['git', '-C', str(path), *args],
+                  text=True, encoding='utf-8').rstrip('\n')
           included = ('src_packages', 'recipes', 'provenance')
           for name in included:
               assert (root / name).is_dir() and any((root / name).iterdir()), name
+          source_roots = [(root / name).resolve() for name in included]
+          def in_source(path):
+              return any(path.is_relative_to(directory) for directory in source_roots)
+          # Recipes link separately fetched sources into submodule paths. Make
+          # runner-absolute links relocatable while retaining their original form.
+          # Autotools may also link host helper files: preserve their actual bytes.
+          for name in included:
+              for base, dirs, files in os.walk(root / name, followlinks=False):
+                  dirs[:] = sorted(d for d in dirs if d != '.git')
+                  for filename in sorted(dirs + files):
+                      link = pathlib.Path(base) / filename
+                      if filename == '.git' or not link.is_symlink():
+                          continue
+                      original = os.readlink(link)
+                      target = link.resolve()
+                      row = {'path': link.relative_to(root).as_posix(),
+                             'original_target': original}
+                      if in_source(target):
+                          relative = pathlib.Path(os.path.relpath(target, link.parent)).as_posix()
+                          row.update(archive_target=relative,
+                              source_target=target.relative_to(root.resolve()).as_posix(),
+                              dangling=not target.exists(), materialized=False)
+                          if original != relative:
+                              is_directory = target.is_dir()
+                              link.unlink()
+                              link.symlink_to(pathlib.Path(relative), target_is_directory=is_directory)
+                      elif target.is_file():
+                          content, mode = target.read_bytes(), target.stat().st_mode
+                          link.unlink()
+                          link.write_bytes(content)
+                          link.chmod(mode)
+                          row.update(archive_target=None, materialized=True,
+                              sha256=hashlib.sha256(content).hexdigest())
+                      else:
+                          raise RuntimeError(f'Source link target cannot be archived: {link} -> {original}')
+                      manifest['symlinks'].append(row)
+          def git_provenance(path):
+              # Do not ask Git to enter symlink-replaced submodules. Record both
+              # HEAD/index gitlinks explicitly; walk real nested checkouts below.
+              head, index = {}, {}
+              for entry in git(path, 'ls-tree', '-r', '-z', 'HEAD').split('\0'):
+                  if entry:
+                      metadata, filename = entry.split('\t', 1)
+                      mode, kind, commit = metadata.split()
+                      if mode == '160000':
+                          head[filename] = commit
+              for entry in git(path, 'ls-files', '--stage', '-z').split('\0'):
+                  if entry:
+                      metadata, filename = entry.split('\t', 1)
+                      mode, commit, stage = metadata.split()
+                      assert stage == '0', f'Unmerged source index: {path}/{filename}'
+                      if mode == '160000':
+                          index[filename] = commit
+              submodules = []
+              for filename in sorted(head.keys() | index.keys()):
+                  child = path / filename
+                  row = {'path': filename, 'head_commit': head.get(filename),
+                         'index_commit': index.get(filename)}
+                  if child.is_symlink():
+                      target = child.resolve(strict=True)
+                      assert target.is_dir() and in_source(target), f'Missing submodule source: {child}'
+                      row.update(state='source_symlink', target=os.readlink(child),
+                          source_path=target.relative_to(root.resolve()).as_posix())
+                      if (target / '.git').exists():
+                          row['actual_commit'] = git(target, 'rev-parse', 'HEAD')
+                  elif (child / '.git').exists():
+                      row.update(state='checkout', actual_commit=git(child, 'rev-parse', 'HEAD'))
+                  else:
+                      row['state'] = 'directory' if child.is_dir() else 'absent'
+                  submodules.append(row)
+              return {'path': path.relative_to(root).as_posix(),
+                  'commit': git(path, 'rev-parse', 'HEAD'),
+                  'status': git(path, 'status', '--porcelain=v1', '--untracked-files=all',
+                                '--ignore-submodules=all'),
+                  'patch': git(path, 'diff', '--binary', '--no-ext-diff', '--no-textconv',
+                               '--ignore-submodules=all', 'HEAD'),
+                  'submodules': submodules}
           toolchain = []
           for directory in (root / 'build', root / 'install_rustup'):
               for base, dirs, files in os.walk(directory):
@@ -222,12 +302,7 @@ jobs:
               for base, dirs, files in os.walk(root / name):
                   path = pathlib.Path(base)
                   if '.git' in dirs or '.git' in files:
-                      patch = git(path, 'diff', '--binary', 'HEAD')
-                      manifest['git'].append({'path': str(path.relative_to(root)),
-                          'commit': git(path, 'rev-parse', 'HEAD'),
-                          'status': git(path, 'status', '--porcelain'),
-                          'patch': patch,
-                          'submodules': git(path, 'submodule', 'status', '--recursive')})
+                      manifest['git'].append(git_provenance(path))
                   # The tar includes .git, patched source trees and downloads.
                   # Installed toolchains and build objects are not source payload.
                   dirs[:] = [d for d in dirs if d != '.git']
@@ -268,6 +343,10 @@ jobs:
           Extract with: tar -I zstd -xf mpv-0.41.0-corresponding-source.tar.zst
           Build instructions: work/provenance/workflow.yml
           Source paths: work/src_packages, work/recipes, work/provenance, work/versions.json
+          Preserve symbolic links when extracting (use Linux or WSL). versions.json
+          records original links, archive-relative targets, materialized host helper
+          files, and HEAD/index/actual submodule revisions. Real linked sources and
+          nested Git checkouts are included; git diff intentionally excludes gitlinks.
           Installed compiler binaries and build objects are excluded. Compiler sources,
           exact source revisions, patches, host packages and compiler hashes are recorded.
           EOF
