@@ -80,6 +80,11 @@ jobs:
           unsupported = '        -Dsubrandr=enabled\n'
           assert text.count(unsupported) == 1, 'mpv subrandr option patch no longer matches'
           text = text.replace(unsupported, '')
+          command = 'BUILD_COMMAND ${EXEC} LTO_JOB=1 ninja -C <BINARY_DIR>'
+          assert text.count(command) == 1, 'mpv verbose build patch no longer matches'
+          text = text.replace(command, command.replace('ninja -C', 'ninja -v -C'))
+          assert text.count('    LOG_DOWNLOAD 1') == 1
+          text = text.replace('    LOG_DOWNLOAD 1', '    LOG_OUTPUT_ON_FAILURE 1\n    LOG_DOWNLOAD 1')
           path.write_text(text, encoding='utf-8')
           path = recipes / 'cmake/custom_steps.cmake'
           text, count = re.subn(r'    ExternalProject_Add_Step\(\$\{_name\} postremovebuild\n.*?\n    \)\n',
@@ -98,13 +103,77 @@ jobs:
             -DSINGLE_SOURCE_LOCATION="$GITHUB_WORKSPACE/work/src_packages" \
             -DRUSTUP_LOCATION="$GITHUB_WORKSPACE/work/install_rustup"
       - name: Compile toolchain and fixed mpv release
+        # Leave time within the 350-minute job for diagnostic collection/upload.
+        timeout-minutes: 330
         run: |
           set -euo pipefail
-          ninja -C work/build gcc
-          ninja -C work/build rustup
-          ninja -C work/build mpv-release
+          mkdir -p work/logs
+          ninja -v -C work/build gcc 2>&1 | tee work/logs/gcc.log
+          ninja -v -C work/build rustup 2>&1 | tee work/logs/rustup.log
+          ninja -v -C work/build mpv-release 2>&1 | tee work/logs/mpv-release.log
           test -f work/build/mpv-0.41.0-x86_64/mpv.exe
           test "$(cat work/src_packages/mpv-release/MPV_VERSION)" = 0.41.0
+      - name: Collect detailed build logs
+        if: ${{ always() }}
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, shutil
+          root = pathlib.Path('work')
+          output = pathlib.Path('diagnostics')
+          output.mkdir(exist_ok=True)
+          files, errors = [], []
+          config_names = {'config.log', 'meson-log.txt', 'CMakeConfigureLog.yaml',
+                          'CMakeOutput.log', 'CMakeError.log'}
+          # Only known build-log types from this disposable runner workspace.
+          # Preserve full bytes and relative paths, including empty stderr logs.
+          for directory in ('logs', 'build', 'src_packages'):
+              start = root / directory
+              if start.is_symlink() or not start.is_dir():
+                  continue
+              for base, dirs, names in os.walk(start, followlinks=False):
+                  base = pathlib.Path(base)
+                  dirs[:] = sorted(d for d in dirs if not d.startswith('.')
+                                   and not (base / d).is_symlink())
+                  for name in sorted(names):
+                      path = base / name
+                      if name.startswith('.') or path.is_symlink() or not path.is_file():
+                          continue
+                      relative = path.relative_to(root)
+                      stamp_log = any(p.endswith('-stamp') for p in relative.parts[:-1]) and name.endswith('.log')
+                      outer_log = directory == 'logs' and name.endswith('.log')
+                      if not (stamp_log or outer_log or name in config_names):
+                          continue
+                      try:
+                          destination = output / relative
+                          destination.parent.mkdir(parents=True, exist_ok=True)
+                          shutil.copyfile(path, destination)
+                          with destination.open('rb') as stream:
+                              digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+                          files.append({'path': relative.as_posix(),
+                                        'bytes': destination.stat().st_size, 'sha256': digest})
+                      except OSError as exc:
+                          errors.append({'path': relative.as_posix(), 'error': str(exc)})
+          manifest = {'run_id': os.environ['GITHUB_RUN_ID'], 'files': files,
+                      'collection_errors': errors, 'empty': not files}
+          (output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
+          (output / 'SHA256SUMS').write_text(
+              ''.join(f"{row['sha256']}  {row['path']}\n" for row in files), encoding='utf-8')
+          print(f"[OK] Preserved {len(files)} complete build logs; collection errors: {len(errors)}")
+          if errors:
+              raise RuntimeError('Some logs could not be collected; see diagnostics/manifest.json')
+          PY
+      - name: Upload detailed build logs
+        if: ${{ always() }}
+        timeout-minutes: 10
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mpv-build-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: diagnostics/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 6
       - name: Archive corresponding sources and build provenance
         run: |
           set -euo pipefail
