@@ -9,6 +9,8 @@ env:
   RECIPE_COMMIT: cd1edc11dc6887a50f705717619d879f5a93a488
   MPV_TAG: v0.41.0
   MPV_SHA256: ee21092a5ee427353392360929dc64645c54479aefdb5babc5cfbb5fad626209
+  LIBVPL_COMMIT: 674d015bcb294bc39fa276e99a652ea045423e82
+  LIBVPL_PATCH_SHA256: 37cfec93ffd6cdc804d1aa576069d843db590c735165e50a058ad692103a8e26
 defaults:
   run:
     shell: bash
@@ -51,8 +53,19 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import os, pathlib, re
+          import hashlib, os, pathlib, re
           recipes = pathlib.Path('work/recipes')
+          # intel/libvpl#198, commit 9cb2dc5: avoid old-MSVC macros on MinGW.
+          patch = pathlib.Path('fork/.github/patches/libvpl-mingw.patch').read_bytes()
+          assert hashlib.sha256(patch).hexdigest() == os.environ['LIBVPL_PATCH_SHA256']
+          (recipes / 'packages/libvpl-mingw.patch').write_bytes(patch)
+          path = recipes / 'packages/libvpl.cmake'
+          text = path.read_text(encoding='utf-8')
+          assert text.count('GIT_TAG main') == 1 and 'PATCH_COMMAND' not in text
+          text = text.replace('GIT_TAG main', 'GIT_TAG ' + os.environ['LIBVPL_COMMIT'])
+          text = text.replace('    UPDATE_COMMAND ""', '    UPDATE_COMMAND ""\n'
+              '    PATCH_COMMAND ${EXEC} git am --3way ${CMAKE_CURRENT_SOURCE_DIR}/libvpl-mingw.patch')
+          path.write_text(text, encoding='utf-8')
           path = recipes / 'packages/mpv-release.cmake'
           text = path.read_text(encoding='utf-8')
           # This upstream revision has neither build.sh nor MPV_TARBALL.
