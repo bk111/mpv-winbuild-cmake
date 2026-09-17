@@ -3,6 +3,13 @@
 name: mpv 0.41.0 with corresponding source
 on:
   workflow_dispatch:
+    inputs:
+      target:
+        description: Package to build
+        required: true
+        default: mpv
+        type: choice
+        options: [mpv, ffmpeg]
 permissions:
   contents: write
 env:
@@ -16,6 +23,7 @@ defaults:
     shell: bash
 jobs:
   build:
+    if: ${{ inputs.target != 'ffmpeg' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 350
     steps:
@@ -365,3 +373,138 @@ jobs:
             --repo "$GITHUB_REPOSITORY" --draft \
             --title 'LingoMaster mpv 0.41.0 - pending validation' \
             --notes 'Binary, corresponding sources, build recipes, provenance, GPL text and hashes are attached together. SOURCE_RESTORE.txt describes split archive reconstruction. Validate Windows playback and source completeness before publishing or syncing to R2.'
+
+  ffmpeg:
+    if: ${{ inputs.target == 'ffmpeg' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+          path: fork
+      - name: Install host build tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential bison flex gettext git mercurial subversion \
+            ninja-build gyp cmake yasm nasm automake pkgconf libtool libtool-bin \
+            gcc-multilib g++-multilib clang lld libgmp-dev libmpfr-dev libmpc-dev \
+            libgcrypt20-dev gperf ragel texinfo autopoint re2c asciidoc python3-venv \
+            docbook2x unzip p7zip-full curl ccache zstd zip
+          python3 -m venv "$RUNNER_TEMP/mpv-python"
+          "$RUNNER_TEMP/mpv-python/bin/pip" install meson rst2pdf mako jsonschema
+          echo "$RUNNER_TEMP/mpv-python/bin" >> "$GITHUB_PATH"
+      - name: Restore verified mpv source closure and prepare ffmpeg
+        run: |
+          set -euo pipefail
+          git config --global user.name "student"
+          git config --global user.email "blackantt@gmail.com"
+          curl --fail --location --retry 3 --output source.tar.zst \
+            https://download.lingomaster.io/tools/mpv-ipc/0.41.0-35124922360/mpv-0.41.0-corresponding-source.tar.zst
+          echo '1945ba456cac3c813637f119ed5356a8217d407974567f0811777852f3104f9c  source.tar.zst' | sha256sum -c -
+          tar -I zstd -xf source.tar.zst
+          mkdir -p work/build/cmake/Modules/ExternalProject work/logs work/ffmpeg-provenance
+          unzip -q work/recipes/cmake/CMake-v3.31.6-Modules-ExternalProject.zip -d work/build/cmake/Modules/ExternalProject
+          curl --fail --location --retry 3 --output work/build/cmake/Modules/ExternalProject.cmake \
+            https://raw.githubusercontent.com/Kitware/CMake/v3.31.6/Modules/ExternalProject.cmake
+          echo '303d2222b3b39df5e94997ec64a07f6877bbf5297978bf3134347389200da695  work/build/cmake/Modules/ExternalProject.cmake' | sha256sum -c -
+          (cd work/build/cmake && patch -p1 -i ../../recipes/packages/cmake-0001-ExternalProject-changes.patch)
+          touch work/build/cmake/Modules/setup_done
+          python3 fork/.github/scripts/ffmpeg_from_mpv.py prepare --module work/build/cmake/Modules/ExternalProject.cmake
+          cp fork/.github/workflows/lingomaster.yml work/ffmpeg-provenance/workflow.yml
+          cp fork/.github/scripts/ffmpeg_from_mpv.py work/ffmpeg-provenance/
+          cp work/build/cmake/Modules/ExternalProject.cmake work/ffmpeg-provenance/ExternalProject.cmake
+          dpkg-query -W > work/ffmpeg-provenance/host-packages.txt
+          pip freeze > work/ffmpeg-provenance/python-build-tools.txt
+          cmake -G Ninja -S work/recipes -B work/build \
+            -DTARGET_ARCH=x86_64-w64-mingw32 -DGCC_ARCH=x86-64 \
+            -DSINGLE_SOURCE_LOCATION="$GITHUB_WORKSPACE/work/src_packages" \
+            -DRUSTUP_LOCATION="$GITHUB_WORKSPACE/work/install_rustup" 2>&1 | tee work/logs/cmake.log
+      - name: Compile static ffmpeg and ffprobe once
+        timeout-minutes: 320
+        run: |
+          set -euo pipefail
+          ninja -v -C work/build gcc 2>&1 | tee work/logs/gcc.log
+          ninja -v -C work/build rustup 2>&1 | tee work/logs/rustup.log
+          ninja -v -C work/build ffmpeg 2>&1 | tee work/logs/ffmpeg.log
+      - name: Package ffmpeg and source supplement
+        run: |
+          set -euo pipefail
+          python3 fork/.github/scripts/ffmpeg_from_mpv.py package
+      - name: Collect detailed build logs
+        if: ${{ always() }}
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, shutil
+          root = pathlib.Path('work')
+          output = pathlib.Path('diagnostics')
+          output.mkdir(exist_ok=True)
+          files, errors = [], []
+          config_names = {'config.log', 'meson-log.txt', 'CMakeConfigureLog.yaml',
+                          'CMakeOutput.log', 'CMakeError.log'}
+          # Only known build-log types from this disposable runner workspace.
+          # Preserve full bytes and relative paths, including empty stderr logs.
+          for directory in ('logs', 'build', 'src_packages'):
+              start = root / directory
+              if start.is_symlink() or not start.is_dir():
+                  continue
+              for base, dirs, names in os.walk(start, followlinks=False):
+                  base = pathlib.Path(base)
+                  dirs[:] = sorted(d for d in dirs if not d.startswith('.')
+                                   and not (base / d).is_symlink())
+                  for name in sorted(names):
+                      path = base / name
+                      if name.startswith('.') or path.is_symlink() or not path.is_file():
+                          continue
+                      relative = path.relative_to(root)
+                      stamp_log = any(p.endswith('-stamp') for p in relative.parts[:-1]) and name.endswith('.log')
+                      outer_log = directory == 'logs' and name.endswith('.log')
+                      if not (stamp_log or outer_log or name in config_names):
+                          continue
+                      try:
+                          destination = output / relative
+                          destination.parent.mkdir(parents=True, exist_ok=True)
+                          shutil.copyfile(path, destination)
+                          with destination.open('rb') as stream:
+                              digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+                          files.append({'path': relative.as_posix(),
+                                        'bytes': destination.stat().st_size, 'sha256': digest})
+                      except OSError as exc:
+                          errors.append({'path': relative.as_posix(), 'error': str(exc)})
+          manifest = {'run_id': os.environ['GITHUB_RUN_ID'], 'files': files,
+                      'collection_errors': errors, 'empty': not files}
+          (output / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
+          (output / 'SHA256SUMS').write_text(
+              ''.join(f"{row['sha256']}  {row['path']}\n" for row in files), encoding='utf-8')
+          print(f"[OK] Preserved {len(files)} complete build logs; collection errors: {len(errors)}")
+          if errors:
+              raise RuntimeError('Some logs could not be collected; see diagnostics/manifest.json')
+          PY
+      - name: Upload detailed build logs
+        if: ${{ always() }}
+        timeout-minutes: 10
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ffmpeg-build-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: diagnostics/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 6
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ffmpeg-binary-and-source-supplement
+          path: output/*
+          if-no-files-found: error
+          retention-days: 14
+      - name: Create ffmpeg-only reviewable draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "lingomaster-ffmpeg-$GITHUB_RUN_ID" output/*.zip output/*.gz output/*.json output/*.txt output/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft \
+            --title 'LingoMaster ffmpeg - pending validation' \
+            --notes 'Static ffmpeg and ffprobe built from the verified source archive shared with mpv 0.41.0 run 35124922360. SOURCE.json pins the existing public archive and the attached source/build supplement. Validate Windows encoders, hardware probes, ffprobe and complete source provenance before publication.'
